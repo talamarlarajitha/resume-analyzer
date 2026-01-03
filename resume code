@@ -1,0 +1,1127 @@
+import streamlit as st
+import sqlite3
+import io
+import json
+import re
+import requests
+import base64
+import time
+import datetime
+import csv
+from typing import Tuple, List, Dict, Any, Optional
+from passlib.hash import argon2
+from docx import Document
+from PyPDF2 import PdfReader
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import pandas as pd
+
+# -------------------------
+# Configuration & Constants
+# -------------------------
+DB_PATH = "resume_analyzer_pink.db"
+USER_AGENT = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+REQUEST_RETRIES = 3
+REQUEST_BACKOFF = 1.2
+CACHE_TTL = 3600  # 1 hour
+
+COMMON_SKILLS = [
+    "python", "java", "c++", "c#", "javascript", "typescript", "react", "node", "angular", "vue",
+    "sql", "postgresql", "mysql", "mongodb", "redis", "aws", "azure", "gcp", "docker",
+    "kubernetes", "terraform", "jenkins", "nlp", "machine learning", "deep learning",
+    "pandas", "numpy", "scikit-learn", "tensorflow", "pytorch", "keras",
+    "git", "html", "css", "rest", "graphql", "api", "linux", "agile", "scrum",
+    "project management", "communication", "leadership", "excel", "power bi", "tableau"
+]
+
+SKILL_COURSE_MAP = {
+    "python": ["Python for Everybody (Coursera)", "Google IT Automation with Python (Coursera)"],
+    "machine learning": ["Machine Learning by Andrew Ng (Coursera)", "Applied Machine Learning (Udemy)"],
+    "nlp": ["Natural Language Processing Specialization (Coursera)", "Practical NLP (Udemy)"],
+    "data analysis": ["Data Analysis with Python (freeCodeCamp)", "IBM Data Analyst Path"],
+    "sql": ["SQL for Data Science (Coursera)", "The Complete SQL Bootcamp (Udemy)"],
+    "react": ["React - The Complete Guide (Udemy)", "Full Stack Open (University of Helsinki)"],
+    "aws": ["AWS Certified Cloud Practitioner (AWS)", "Ultimate AWS Certified Solutions Architect (Udemy)"],
+    "docker": ["Docker & Kubernetes: The Practical Guide (Udemy)"],
+    "java": ["Java Programming Masterclass (Udemy)"],
+    "javascript": ["The Complete JavaScript Course (Udemy)"],
+    "communication": ["Business Communication (Coursera)", "Effective Communication (Udemy)"],
+    "project management": ["Google Project Management Certificate", "PMP Exam Prep (Udemy)"]
+}
+
+# -------------------------
+# UI & Helper Utilities
+# -------------------------
+PINK_THEME_CSS = """
+<style>
+/* Light Pink Background & Effective UI */
+[data-testid="stAppViewContainer"] {
+    background-color: #FFF0F5; /* Lavender Blush */
+    color: #333333;
+}
+[data-testid="stSidebar"] {
+    background-color: #FFFFFF;
+    border-right: 1px solid #E6E6E6;
+}
+.section {
+    background: white;
+    padding: 25px;
+    border-radius: 15px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+    margin-bottom: 25px;
+    border-left: 5px solid #D81B60; /* Pink accent */
+}
+.metric-box {
+    text-align: center;
+    padding: 15px;
+    border-radius: 12px;
+    background: #FFFFFF;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+    border: 1px solid #F8BBD0;
+    margin-bottom: 10px;
+}
+.metric-val { font-size: 28px; font-weight: bold; color: #D81B60; }
+.metric-lbl { font-size: 14px; color: #666; font-weight: 600; text-transform: uppercase; }
+
+.job-card { 
+    padding: 20px; 
+    border-radius: 12px; 
+    border: 1px solid #FCE4EC; 
+    margin-bottom: 20px; 
+    background: #fff; 
+    transition: transform 0.2s;
+}
+.job-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 5px 15px rgba(216, 27, 96, 0.1);
+}
+.job-title { font-size: 20px; font-weight: 700; color: #880E4F; }
+.tag { 
+    background: #FCE4EC; 
+    color: #C2185B; 
+    padding: 5px 10px; 
+    border-radius: 15px; 
+    font-size: 12px; 
+    margin-right: 6px; 
+    font-weight: 600;
+}
+h1, h2, h3 { color: #880E4F !important; }
+.stButton>button {
+    background-color: #D81B60;
+    color: white;
+    border-radius: 8px;
+    border: none;
+    font-weight: 600;
+}
+.stButton>button:hover {
+    background-color: #AD1457;
+}
+/* Delete Button Specific */
+.delete-btn {
+    border: 1px solid #ff4b4b !important;
+    background-color: white !important;
+    color: #ff4b4b !important;
+}
+</style>
+"""
+
+def safe_read_bytes(file) -> bytes:
+    try:
+        file.seek(0)
+        return file.read()
+    except Exception:
+        return b""
+
+def now_iso() -> str:
+    return datetime.datetime.utcnow().isoformat() + "Z"
+
+def rerun():
+    try:
+        from streamlit.runtime.scriptrunner import RerunException, get_script_run_ctx
+        raise RerunException(get_script_run_ctx())
+    except ImportError:
+        st.experimental_rerun()
+
+def get_file_size_str(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{round(size_bytes/1024, 1)} KB"
+    else:
+        return f"{round(size_bytes/(1024*1024), 2)} MB"
+
+def determine_rank(score: float) -> str:
+    if score >= 90: return "🏆 S-Tier (Top 5%)"
+    if score >= 80: return "🥇 A-Tier (Excellent)"
+    if score >= 70: return "🥈 B-Tier (Good)"
+    if score >= 50: return "🥉 C-Tier (Average)"
+    return "⚠️ Needs Improvement"
+
+# -------------------------
+# Database Engine
+# -------------------------
+def init_db(path: str = DB_PATH) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, check_same_thread=False)
+    c = conn.cursor()
+    
+    # Users Table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            email TEXT,
+            password_hash TEXT,
+            role TEXT DEFAULT 'user',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Jobs Table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_name TEXT,
+            title TEXT,
+            description TEXT,
+            required_skills TEXT,
+            salary TEXT,
+            experience TEXT,
+            location TEXT,
+            work_mode TEXT,
+            created_by INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Applications/Analyses Table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS applications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER,
+            user_id INTEGER,
+            name TEXT,
+            email TEXT,
+            resume_text TEXT,
+            linkedin TEXT,
+            github TEXT,
+            score REAL,
+            metadata TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Feedback Table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            category TEXT,
+            message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.commit()
+    return conn
+
+_conn = init_db()
+
+# -------------------------
+# Network & Profile Fetching
+# -------------------------
+def _request_with_retries(url: str, headers: dict = None, timeout: int = 10) -> Optional[requests.Response]:
+    headers = headers or USER_AGENT
+    backoff = 1.0
+    for _ in range(REQUEST_RETRIES):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                return r
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(backoff)
+                backoff *= REQUEST_BACKOFF
+                continue
+            return r
+        except requests.RequestException:
+            time.sleep(backoff)
+            backoff *= REQUEST_BACKOFF
+            continue
+    return None
+
+@st.cache_data(ttl=CACHE_TTL)
+def fetch_github_profile(github_url: str) -> Dict[str, Any]:
+    if not github_url:
+        return {}
+    m = re.search(r"github\.com/([A-Za-z0-9\-]+)", github_url)
+    if not m:
+        return {}
+    username = m.group(1)
+    api_user = f"https://api.github.com/users/{username}"
+    api_repos = f"https://api.github.com/users/{username}/repos?per_page=20&sort=updated"
+    
+    try:
+        user_r = _request_with_retries(api_user, headers=USER_AGENT)
+        if not user_r or user_r.status_code != 200:
+            return {}
+        user_data = user_r.json()
+        
+        repos_r = _request_with_retries(api_repos, headers=USER_AGENT)
+        repo_list = []
+        languages = set()
+        
+        if repos_r and repos_r.status_code == 200:
+            for repo in repos_r.json():
+                desc = repo.get('description') or 'No description'
+                repo_list.append({"name": repo.get('name'), "desc": desc, "lang": repo.get('language')})
+                if repo.get('language'):
+                    languages.add(repo.get('language'))
+        
+        summary_text = f"{user_data.get('bio') or ''} {user_data.get('name') or ''} {user_data.get('company') or ''} "
+        for r in repo_list:
+            summary_text += f"{r['name']} {r['desc']} "
+        
+        return {
+            "text": summary_text,
+            "languages": sorted(list(languages)),
+            "repos": repo_list,
+            "public_repos": user_data.get("public_repos", 0),
+            "followers": user_data.get("followers", 0)
+        }
+    except Exception:
+        return {}
+
+# -------------------------
+# NLP & Extraction Logic
+# -------------------------
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^\x00-\x7F]+", " ", text)
+    return text.strip()
+
+def extract_text_from_file(file_obj) -> Tuple[str, int]:
+    if not file_obj:
+        return "", 0
+    try:
+        file_obj.seek(0)
+        ext = file_obj.name.split('.')[-1].lower()
+        if ext == 'pdf':
+            reader = PdfReader(file_obj)
+            pages = len(reader.pages)
+            parts = [p.extract_text() or "" for p in reader.pages]
+            return "\n".join(parts), pages
+        elif ext == 'docx':
+            doc = Document(file_obj)
+            paragraphs = [p.text for p in doc.paragraphs]
+            pages = max(1, len(paragraphs) // 40)
+            return "\n".join(paragraphs), pages
+        else:
+            txt = file_obj.read().decode("utf-8", errors="ignore")
+            pages = max(1, len(txt) // 3000)
+            return txt, pages
+    except Exception:
+        return "", 0
+
+def extract_email_from_text(text: str) -> str:
+    emails = re.findall(r'[\w.+-]+@[\w-]+\.[\w.-]+', text)
+    return emails[0] if emails else ""
+
+def extract_certifications(text: str) -> List[str]:
+    found = []
+    keywords = [
+        "certified", "certification", "aws solution architect", "pmp", "scrum master", 
+        "google data analytics", "azure fundamentals", "cissp", "comptia", "cisco",
+        "oracle certified", "meta backend", "ibm data science"
+    ]
+    lines = text.split('\n')
+    for line in lines:
+        for k in keywords:
+            if k in line.lower() and len(line) < 120:
+                found.append(line.strip())
+                break
+    return list(set(found))[:8]
+
+def extract_skills(text: str) -> List[str]:
+    txt = clean_text(text).lower()
+    found = set()
+    for skill in COMMON_SKILLS:
+        if re.search(r"\b" + re.escape(skill) + r"\b", txt):
+            found.add(skill)
+    blocks = re.findall(r"(?:skills|technologies)[:\-\n]+([\w\s,\-\/\\+]+)", txt)
+    for block in blocks:
+        tokens = re.split(r"[,;/\n|]+", block)
+        for t in tokens:
+            t = t.strip().lower()
+            if t in COMMON_SKILLS:
+                found.add(t)
+    return sorted(found)
+
+def compute_match_score(job_text: str, resume_text: str, linkedin_text: str = "", github_text: str = "") -> Tuple[float, Dict[str, Any]]:
+    corpus = [job_text or "", resume_text or "", linkedin_text or "", github_text or ""]
+    sim_resume = sim_linked = sim_github = 0.0
+    
+    try:
+        vectorizer = TfidfVectorizer(stop_words='english')
+        tfidf = vectorizer.fit_transform(corpus)
+        sim_resume = float(cosine_similarity(tfidf[0:1], tfidf[1:2])[0][0])
+        if linkedin_text: sim_linked = float(cosine_similarity(tfidf[0:1], tfidf[2:3])[0][0])
+        if github_text: sim_github = float(cosine_similarity(tfidf[0:1], tfidf[3:4])[0][0])
+    except Exception:
+        pass
+
+    req_skills = set(extract_skills(job_text))
+    resume_skills = set(extract_skills(resume_text))
+    linked_skills = set(extract_skills(linkedin_text))
+    github_skills = set(extract_skills(github_text))
+    
+    found_skills = resume_skills | linked_skills | github_skills
+    missing_skills = sorted(list(req_skills - found_skills))
+    
+    overlap_ratio = 0.0
+    if req_skills:
+        overlap_ratio = len(req_skills & found_skills) / len(req_skills)
+
+    raw_score = (0.55 * sim_resume) + (0.35 * overlap_ratio) + (0.05 * sim_linked) + (0.05 * sim_github)
+    score = round(max(0.0, min(1.0, raw_score)) * 100, 1)
+
+    details = {
+        "sim_resume": round(sim_resume, 3),
+        "required_skills": sorted(list(req_skills)),
+        "found_skills": sorted(list(found_skills)),
+        "missing_skills": missing_skills,
+        "overlap_ratio": round(overlap_ratio, 3)
+    }
+    return score, details
+
+def recommend_courses(missing_skills: List[str]) -> Dict[str, List[str]]:
+    rec = {}
+    for ms in missing_skills:
+        ms_lower = ms.lower()
+        matched = False
+        for key, courses in SKILL_COURSE_MAP.items():
+            if key in ms_lower or ms_lower in key:
+                rec[ms] = courses
+                matched = True
+                break
+        if not matched:
+            rec[ms] = [f"Search for beginner {ms} courses on Coursera/Udemy"]
+    return rec
+
+def analyze_file_quality(resume_text: str, pages: int, file_size: int) -> Dict[str, Any]:
+    text = resume_text or ""
+    words = re.findall(r'\w+', text)
+    
+    seniority = "Entry Level"
+    if re.search(r"senior|lead|principal|architect|manager", text, re.I): seniority = "Senior"
+    elif re.search(r"mid|associate", text, re.I): seniority = "Mid-Level"
+    elif re.search(r"\b(\d+)\s+years", text):
+        yrs = int(re.search(r"\b(\d+)\s+years", text).group(1))
+        if yrs > 5: seniority = "Senior"
+        elif yrs > 2: seniority = "Mid-Level"
+
+    suggestions = []
+    if pages > 2 and seniority == "Entry Level": suggestions.append("Condense to 1-2 pages.")
+    if len(words) < 200: suggestions.append("Resume seems too short.")
+    if "education" not in text.lower(): suggestions.append("Add an Education section.")
+    
+    return {
+        "pages": pages,
+        "seniority": seniority,
+        "word_count": len(words),
+        "file_size": get_file_size_str(file_size),
+        "suggestions": suggestions
+    }
+
+# -------------------------
+# Auth & DB Actions
+# -------------------------
+def create_user(username, email, password, role="user"):
+    try:
+        ph = argon2.hash(password)
+        c = _conn.cursor()
+        c.execute("INSERT INTO users (username, email, password_hash, role) VALUES (?,?,?,?)", (username, email, ph, role))
+        _conn.commit()
+        return True, "User registered."
+    except sqlite3.IntegrityError:
+        return False, "Username already exists."
+    except Exception as e:
+        return False, str(e)
+
+def authenticate_user(username, password):
+    c = _conn.cursor()
+    c.execute("SELECT id, username, email, password_hash, role FROM users WHERE username=?", (username,))
+    row = c.fetchone()
+    if row and argon2.verify(password, row[3]):
+        return True, {"id": row[0], "username": row[1], "email": row[2], "role": row[4]}
+    return False, None
+
+def add_job(company, title, desc, skills_list, salary, exp, loc, mode, creator_id):
+    c = _conn.cursor()
+    skills_str = json.dumps(skills_list)
+    c.execute("""INSERT INTO jobs (company_name, title, description, required_skills, salary, experience, location, work_mode, created_by)
+                 VALUES (?,?,?,?,?,?,?,?,?)""", 
+              (company, title, desc, skills_str, salary, exp, loc, mode, creator_id))
+    _conn.commit()
+
+def delete_job(job_id: int):
+    c = _conn.cursor()
+    c.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+    _conn.commit()
+
+def list_jobs():
+    c = _conn.cursor()
+    c.execute("SELECT * FROM jobs ORDER BY created_at DESC")
+    cols = [d[0] for d in c.description]
+    return [dict(zip(cols, row)) for row in c.fetchall()]
+
+def save_application(job_id, user_id, name, email, resume_text, linkedin, github, score, metadata):
+    c = _conn.cursor()
+    c.execute("""INSERT INTO applications (job_id, user_id, name, email, resume_text, linkedin, github, score, metadata)
+                 VALUES (?,?,?,?,?,?,?,?,?)""",
+              (job_id, user_id, name, email, resume_text, linkedin, github, score, json.dumps(metadata)))
+    _conn.commit()
+
+def submit_feedback(user_id, username, category, message):
+    c = _conn.cursor()
+    c.execute("INSERT INTO feedback (user_id, username, category, message) VALUES (?, ?, ?, ?)", 
+              (user_id, username, category, message))
+    _conn.commit()
+
+# -------------------------
+# Dashboard Data Fetchers
+# -------------------------
+def get_admin_stats():
+    c = _conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users")
+    total_users = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM jobs")
+    total_jobs = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM applications")
+    total_apps = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM feedback")
+    total_feedback = c.fetchone()[0]
+    return total_users, total_jobs, total_apps, total_feedback
+
+def get_user_stats(user_id):
+    c = _conn.cursor()
+    c.execute("SELECT COUNT(*), AVG(score) FROM applications WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    count_apps = row[0] if row else 0
+    avg_score = round(row[1], 1) if row and row[1] else 0
+    
+    # Get recent activity
+    c.execute("""SELECT j.title, a.score, a.created_at 
+                 FROM applications a LEFT JOIN jobs j ON a.job_id = j.id 
+                 WHERE a.user_id=? ORDER BY a.created_at DESC LIMIT 3""", (user_id,))
+    recent = c.fetchall()
+    return count_apps, avg_score, recent
+
+# -------------------------
+# Main App UI
+# -------------------------
+def main():
+    if "force_nav" in st.session_state:
+        st.session_state["nav_selection"] = st.session_state["force_nav"]
+        del st.session_state["force_nav"]
+
+    st.set_page_config(page_title="Resume Analyzer", layout="wide",)
+    st.markdown(PINK_THEME_CSS, unsafe_allow_html=True)
+    
+    # Initialize Auth State
+    if 'auth' not in st.session_state:
+        st.session_state['auth'] = {"logged_in": False, "user": None}
+
+    # Header
+    col1, col2 = st.columns([3,1])
+    with col1:
+        st.title("Resume Analyzer")
+        st.caption("Job Matching & Skill Gap Analysis")
+    with col2:
+        if st.session_state['auth']['logged_in']:
+            u = st.session_state['auth']['user']
+            st.success(f"💖 Hello, {u['username']}")
+            if st.button("Logout"):
+                st.session_state['auth'] = {"logged_in": False, "user": None}
+                st.session_state['nav_selection'] = "Home"
+                rerun()
+        else:
+            st.info("Guest Mode (Login for full access)")
+
+    # Sidebar Navigation & Logic
+    if 'nav_selection' not in st.session_state:
+        st.session_state['nav_selection'] = "Home"
+
+    # Define Navigation Options based on Auth State
+    if st.session_state['auth']['logged_in']:
+        role = st.session_state['auth']['user']['role']
+        if role == 'admin':
+            # Remove "Analyze Resume" and "My Applications" for Admin
+            nav_opts = ["Home", "My Dashboard", "Jobs Board", "Admin Panel", "Help & Support"]
+        else:
+            # Full menu for standard users
+            nav_opts = ["Home", "My Dashboard", "Jobs Board", "Analyze Resume", "My Applications", "Help & Support"]
+    else:
+        # Menu for Guests
+        nav_opts = ["Home", "Jobs Board", "Analyze Resume", "Help & Support", "Login / Sign Up"]
+
+    nav = st.sidebar.radio("Navigation", nav_opts, key="nav_selection")
+    
+    # ------------------
+    # SECTIONS
+    # ------------------
+    
+    # 1. LOGIN / SIGN UP (Main Page)
+    if nav == "Login / Sign Up":
+        st.markdown("<div class='section'>", unsafe_allow_html=True)
+        st.subheader("Welcome! Please Login or Register")
+        
+        tab_login, tab_register = st.tabs(["🔐 Login", "📝 Register"])
+        
+        with tab_login:
+            st.markdown("#### Sign In to your Account")
+            with st.form("login_form"):
+                u = st.text_input("Username")
+                p = st.text_input("Password", type="password")
+                sub_login = st.form_submit_button("Sign In")
+                
+                if sub_login:
+                    if not u or not p:
+                        st.error("Please enter both username and password.")
+                    else:
+                        ok, data = authenticate_user(u, p)
+                        if ok:
+                            st.session_state['auth'] = {"logged_in": True, "user": data}
+                            st.success("Login Successful! Redirecting...")
+                            time.sleep(1)
+                            # Update Redirect Logic:
+                            if data['role'] == 'admin':
+                                st.session_state['force_nav'] = "Admin Panel"
+                            else:
+                                st.session_state['force_nav'] = "Analyze Resume"
+                            rerun()
+                        else:
+                            st.error("Invalid credentials.")
+        
+        with tab_register:
+            st.markdown("#### Create a New Account")
+            with st.form("register_form"):
+                nu = st.text_input("Choose Username")
+                ne = st.text_input("Email Address")
+                np = st.text_input("Choose Password", type="password")
+                role = st.selectbox("Role", ["user", "admin"]) 
+                sub_reg = st.form_submit_button("Create Account")
+                
+                if sub_reg:
+                    if not nu or not ne or not np:
+                        st.error("All fields are required.")
+                    else:
+                        ok, msg = create_user(nu, ne, np, role)
+                        if ok:
+                            st.success("Account created successfully! Please switch to the Login tab to sign in.")
+                        else:
+                            st.error(msg)
+                            
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # 2. HOME (Landing Page)
+    elif nav == "Home":
+        st.markdown("<div class='section'>", unsafe_allow_html=True)
+        st.subheader("Welcome to the Hub")
+        st.write("""
+        This tool helps candidates optimize their resumes and recruiters find the best talent.
+        
+        **Key Features:**
+        *   📊 **My Dashboard:** View your stats and recent activity.
+        *   📄 **Resume Analysis:** Upload your resume to extract skills, email, and certifications.
+        *   📁 **Jobs Board:** Find and apply to open positions.
+        *   🐱 **GitHub Integration:** Analyze repositories, counts, and languages.
+        *   🎓 **Course Recommendations:** Fill your skill gaps immediately.
+        """)
+        
+        if not st.session_state['auth']['logged_in']:
+            st.info("👉 **Tip:** Go to **Login / Sign Up** in the sidebar to access your dashboard and save applications.")
+            if st.button("Go to Login"):
+                st.session_state['force_nav'] = "Login / Sign Up"
+                rerun()
+        else:
+            st.success("You are logged in! Navigate to explore features.")
+        
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # 3. MY DASHBOARD
+    elif nav == "My Dashboard":
+        st.markdown("<div class='section'>", unsafe_allow_html=True)
+        
+        if not st.session_state['auth']['logged_in']:
+            st.warning("Please login to view your dashboard.")
+        else:
+            # Scenario A: Admin Dashboard
+            if st.session_state['auth']['user']['role'] == 'admin':
+                st.subheader("📊 System Dashboard (Admin)")
+                t_users, t_jobs, t_apps, t_feed = get_admin_stats()
+                
+                # Metrics
+                d1, d2, d3, d4 = st.columns(4)
+                d1.markdown(f"<div class='metric-box'><div class='metric-val'>{t_users}</div><div class='metric-lbl'>Total Users</div></div>", unsafe_allow_html=True)
+                d2.markdown(f"<div class='metric-box'><div class='metric-val'>{t_jobs}</div><div class='metric-lbl'>Active Jobs</div></div>", unsafe_allow_html=True)
+                d3.markdown(f"<div class='metric-box'><div class='metric-val'>{t_apps}</div><div class='metric-lbl'>Applications</div></div>", unsafe_allow_html=True)
+                d4.markdown(f"<div class='metric-box'><div class='metric-val'>{t_feed}</div><div class='metric-lbl'>Feedback Items</div></div>", unsafe_allow_html=True)
+
+                st.markdown("---")
+                st.write("### Quick Actions")
+                qa1, qa2 = st.columns(2)
+                with qa1:
+                    st.info("💡 **Tip:** Go to 'Admin Panel' to post new jobs or review detailed applications.")
+                with qa2:
+                    if st.button("Go to Admin Panel"):
+                        st.session_state['force_nav'] = "Admin Panel"
+                        rerun()
+
+            # Scenario B: User Dashboard
+            else:
+                u_id = st.session_state['auth']['user']['id']
+                c_apps, avg_s, recent_act = get_user_stats(u_id)
+                
+                st.subheader("My Career Dashboard")
+                
+                # Metrics
+                u1, u2, u3 = st.columns(3)
+                u1.markdown(f"<div class='metric-box'><div class='metric-val'>{c_apps}</div><div class='metric-lbl'>Jobs Applied</div></div>", unsafe_allow_html=True)
+                u2.markdown(f"<div class='metric-box'><div class='metric-val'>{avg_s}%</div><div class='metric-lbl'>Avg Match Score</div></div>", unsafe_allow_html=True)
+                tier_emoji = "🥉"
+                if avg_s >= 80: tier_emoji = "🥇"
+                elif avg_s >= 70: tier_emoji = "🥈"
+                u3.markdown(f"<div class='metric-box'><div class='metric-val'>{tier_emoji}</div><div class='metric-lbl'>Current Tier</div></div>", unsafe_allow_html=True)
+                
+                st.markdown("---")
+                st.markdown("### 🕒 Recent Activity")
+                if not recent_act:
+                    st.info("No recent applications. Check the Job Board!")
+                else:
+                    for ra in recent_act:
+                        title = ra[0] or "Self Analysis"
+                        sc = ra[1]
+                        dt = ra[2][:10]
+                        st.write(f"**{title}** | Score: {sc}% | Date: {dt}")
+                
+                st.markdown("---")
+                if st.button("Browse Jobs"):
+                    st.session_state['force_nav'] = "Jobs Board"
+                    rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    elif nav == "Jobs Board":
+        st.subheader("Current Openings 💼")
+        jobs = list_jobs()
+        if not jobs:
+            st.info("No jobs posted yet.")
+        else:
+            for job in jobs:
+                st.markdown(f"""
+                <div class="job-card">
+                    <div class="job-title">{job['title']}</div>
+                    <div style="color: #666; font-size: 14px;">@ {job['company_name']}</div>
+                    <div style="margin:10px 0;">
+                        <span class="tag">📍 {job['location']}</span>
+                        <span class="tag">💼 {job['work_mode']}</span>
+                        <span class="tag">💰 {job['salary']}</span>
+                    </div>
+                    <div style="font-size:14px; color:#555;">{job['description'][:200]}...</div>
+                </div>
+                """, unsafe_allow_html=True)
+                with st.expander(f"Apply to {job['title']}"):
+                    st.write("**Full Description:**", job['description'])
+                    st.write("**Skills:**", job['required_skills'])
+                    if st.button(f"Apply for {job['title']}", key=f"apply_btn_{job['id']}"):
+                       st.session_state['target_job_id'] = job['id']
+                       st.session_state['force_nav'] = "Analyze Resume"
+                       st.rerun()
+
+    elif nav == "Analyze Resume":
+        st.markdown("<div class='section'>", unsafe_allow_html=True)
+        st.subheader("🚀 Resume Analyzer & Ranker")
+        
+        col_in1, col_in2 = st.columns(2)
+        with col_in1:
+            st.markdown("#### Candidate Details")
+            c_name = st.text_input("Full Name")
+            c_email = st.text_input("Email (will auto-fill from resume/linkedin)")
+            upl_file = st.file_uploader("Upload Resume (PDF/DOCX)", type=["pdf","docx"], key="resume_upl")
+            li_file = st.file_uploader("Upload LinkedIn Profile (PDF)", type=["pdf"], key="li_upl")
+            c_gh = st.text_input("GitHub Profile URL")
+        
+        with col_in2:
+            st.markdown("#### Job Target")
+            radio_idx = 0
+            if 'target_job_id' in st.session_state:
+                radio_idx = 2
+
+            jd_source = st.radio("Source", ["Paste Text", "Upload JD", "Select Job"], index=radio_idx)
+            jd_text = ""
+            selected_job_id = 0
+
+            if jd_source == "Paste Text":
+                jd_text = st.text_area("Job Description", height=200)
+            elif jd_source == "Upload JD":
+                jd_file = st.file_uploader("Upload JD File", type=["pdf","docx","txt"])
+                if jd_file:
+                    jd_text, _ = extract_text_from_file(jd_file)
+            else:
+                jobs = list_jobs()
+                job_options = [f"{j['id']}: {j['title']}" for j in jobs]
+                sel_idx = 0
+                if 'target_job_id' in st.session_state:
+                    for idx, option in enumerate(job_options):
+                        if option.startswith(f"{st.session_state['target_job_id']}:"):
+                            sel_idx = idx
+                            break
+                    del st.session_state['target_job_id']
+
+                sel_job = st.selectbox("Select Job", job_options, index=sel_idx)
+                if sel_job:
+                    jid = int(sel_job.split(':')[0])
+                    selected_job_id = jid
+                    jd_text = next((j['description'] for j in jobs if j['id'] == jid), "")
+
+        btn_label = "✨ Analyze & Apply" if selected_job_id > 0 else "✨ Analyze & Rank"
+
+        if st.button(btn_label):
+            if not upl_file or not jd_text:
+                st.error("Please provide both Resume and Job Description.")
+            else:
+                with st.spinner("Analyzing files and profile..."):
+                    r_txt, r_pgs = extract_text_from_file(upl_file)
+                    file_size = upl_file.size
+                    
+                    li_txt = ""
+                    li_skills = []
+                    li_certs = []
+                    li_email = ""
+                    if li_file:
+                        li_txt, _ = extract_text_from_file(li_file)
+                        li_email = extract_email_from_text(li_txt)
+                        li_skills = extract_skills(li_txt)
+                        li_certs = extract_certifications(li_txt)
+
+                    gh_data = fetch_github_profile(c_gh)
+                    extracted_resume_email = extract_email_from_text(r_txt)
+                    final_email = c_email if c_email else (extracted_resume_email or li_email)
+                    
+                    score, details = compute_match_score(jd_text, r_txt, li_txt, gh_data.get('text', ''))
+                    rank = determine_rank(score)
+                    quality = analyze_file_quality(r_txt, r_pgs, file_size)
+
+                    if st.session_state['auth']['logged_in']:
+                        uid = st.session_state['auth']['user']['id']
+                        meta = {
+                            "details": details, 
+                            "quality": quality, 
+                            "gh_stats": gh_data, 
+                            "li_extracted": {"email": li_email, "skills": li_skills, "certs": li_certs}
+                        }
+                        save_application(selected_job_id, uid, c_name, final_email, r_txt, str(li_file.name if li_file else ""), c_gh, score, meta)
+                        if selected_job_id > 0:
+                            st.success(f"Application Submitted Successfully for Job ID {selected_job_id}!")
+
+                st.markdown("---")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.markdown(f"<div class='metric-box'><div class='metric-val'>{score}%</div><div class='metric-lbl'>Match Score</div></div>", unsafe_allow_html=True)
+                m2.markdown(f"<div class='metric-box'><div class='metric-val'>{rank.split(' ')[1]}</div><div class='metric-lbl'>Rank Tier</div></div>", unsafe_allow_html=True)
+                m3.markdown(f"<div class='metric-box'><div class='metric-val'>{len(details['found_skills'])}</div><div class='metric-lbl'>Total Skills Found</div></div>", unsafe_allow_html=True)
+                m4.markdown(f"<div class='metric-box'><div class='metric-val'>{len(details['missing_skills'])}</div><div class='metric-lbl'>Skill Gaps</div></div>", unsafe_allow_html=True)
+
+                st.write("")
+                st.info(f"📧 **Email Identified:** {final_email or 'Not Found'}")
+
+                t_skill, t_li, t_gh, t_qual, t_rec = st.tabs([
+                    "🧠 Job Match", "📁 LinkedIn Data", "🐱 GitHub Data", "📝 Resume Quality", "🎓 Courses"
+                ])
+
+                with t_skill:
+                    sc1, sc2 = st.columns(2)
+                    with sc1:
+                        st.markdown("#### ✅ Matched Skills")
+                        for s in set(details['required_skills']) & set(details['found_skills']):
+                            st.success(f"• {s}")
+                        if not (set(details['required_skills']) & set(details['found_skills'])):
+                            st.write("No matches found.")
+                    with sc2:
+                        st.markdown("#### ⚠️ Missing Skills")
+                        for s in details['missing_skills']:
+                            st.error(f"• {s}")
+                        if not details['missing_skills']:
+                            st.success("No missing skills!")
+
+                with t_li:
+                    if li_file:
+                        st.markdown("#### 📄 Data Extracted from LinkedIn PDF")
+                        st.write(f"**Extracted Email:** {li_email if li_email else 'Not found in file'}")
+                        
+                        l1, l2 = st.columns(2)
+                        with l1:
+                            st.write("**Skills found in File:**")
+                            if li_skills:
+                                st.info(", ".join(li_skills))
+                            else: st.write("No skills detected.")
+                        with l2:
+                            st.write("**Certifications found in File:**")
+                            if li_certs:
+                                for c in li_certs: st.success(f"• {c}")
+                            else: st.write("No certifications detected.")
+                    else:
+                        st.warning("No LinkedIn profile file uploaded.")
+
+                with t_gh:
+                    if gh_data:
+                        st.markdown(f"#### 🐱 GitHub: {gh_data.get('public_repos', 0)} Repositories")
+                        st.write(f"**Followers:** {gh_data.get('followers', 0)}")
+                        
+                        g1, g2 = st.columns(2)
+                        with g1:
+                            st.markdown("**Languages Used:**")
+                            st.write(", ".join(gh_data.get('languages', [])))
+                        with g2:
+                            st.markdown("**Recent Repositories:**")
+                            for repo in gh_data.get('repos', [])[:5]:
+                                st.markdown(f"- **{repo['name']}**: _{repo['desc']}_")
+                    else:
+                        st.warning("GitHub URL not provided or invalid.")
+
+                with t_qual:
+                    q1, q2 = st.columns(2)
+                    with q1:
+                        st.write(f"**Seniority:** {quality['seniority']}")
+                        st.write(f"**Pages:** {quality['pages']}")
+                        st.write(f"**Word Count:** {quality['word_count']}")
+                        st.write(f"**File Size:** {quality['file_size']}")
+                    with q2:
+                        st.write("**Suggestions:**")
+                        for sug in quality['suggestions']:
+                            st.warning(f"• {sug}")
+                        if not quality['suggestions']:
+                            st.success("Formatting looks great!")
+
+                with t_rec:
+                    st.write("You have the required skills")
+                    recs = recommend_courses(details['missing_skills'])
+                    for skill, courses in recs.items():
+                        with st.expander(f"Learn **{skill}**"):
+                            for c in courses: st.markdown(f"🔗 [{c}](#)")
+
+                csv_data = [
+                    ["Name", "Email", "Score", "Rank", "Matched Skills", "Missing Skills", "File Size", "GitHub Repos"],
+                    [c_name, final_email, f"{score}%", rank, 
+                     ", ".join(details['found_skills']), 
+                     ", ".join(details['missing_skills']),
+                     quality['file_size'], gh_data.get('public_repos', 0)]
+                ]
+                si = io.StringIO()
+                cw = csv.writer(si)
+                cw.writerows(csv_data)
+                st.download_button(
+                    label="📥 Download Result as CSV",
+                    data=si.getvalue(),
+                    file_name="resume_analysis_result.csv",
+                    mime="text/csv"
+                )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    elif nav == "Admin Panel":
+        if st.session_state['auth']['logged_in'] and st.session_state['auth']['user']['role'] == 'admin':
+            st.subheader("Admin Dashboard 🛠️")
+            tab_admin = st.tabs(["Post Job", "Manage Jobs", "View Applications", "User Feedback"])
+            
+            with tab_admin[0]:
+                with st.form("post"):
+                    jc = st.text_input("Company")
+                    jt = st.text_input("Title")
+                    jd = st.text_area("Desc")
+                    jsk = st.text_input("Skills (comma sep)")
+                    jsal = st.text_input("Salary")
+                    jexp = st.text_input("Exp")
+                    jloc = st.text_input("Loc")
+                    jmode = st.selectbox("Mode", ["Remote","Hybrid","On-site"])
+                    if st.form_submit_button("Post"):
+                        s_list = [x.strip() for x in jsk.split(',') if x.strip()]
+                        add_job(jc, jt, jd, s_list, jsal, jexp, jloc, jmode, st.session_state['auth']['user']['id'])
+                        st.success("Posted!")
+            
+            with tab_admin[1]:
+                st.markdown("### Existing Jobs")
+                jobs = list_jobs()
+                if not jobs:
+                    st.info("No jobs to manage.")
+                else:
+                    for j in jobs:
+                        with st.container():
+                            c1, c2 = st.columns([5, 1])
+                            with c1:
+                                st.markdown(f"**{j['title']}** at *{j['company_name']}*")
+                            with c2:
+                                if st.button("🗑️ Delete", key=f"del_{j['id']}", type="primary"):
+                                    delete_job(j['id'])
+                                    st.success(f"Deleted {j['title']}")
+                                    time.sleep(0.5)
+                                    rerun()
+                            with st.expander("View Details"):
+                                st.write(f"**Description:** {j['description']}")
+                                st.write(f"**Salary:** {j['salary']} | **Loc:** {j['location']}")
+                                st.write(f"**Skills:** {j['required_skills']}")
+                            st.markdown("---")
+            
+            with tab_admin[2]:
+                c = _conn.cursor()
+                c.execute("""SELECT a.id, a.name, a.email, a.score, j.title, a.created_at, a.metadata, a.github, a.linkedin, a.resume_text 
+                             FROM applications a 
+                             LEFT JOIN jobs j ON a.job_id = j.id 
+                             ORDER BY a.score DESC""")
+                all_apps = c.fetchall()
+
+                if all_apps:
+                    st.markdown("### 📋 Applications Summary")
+                    total_apps = len(all_apps)
+                    avg_score = sum(x[3] for x in all_apps) / total_apps if total_apps else 0
+                    m1, m2 = st.columns(2)
+                    m1.metric("Total Applications", total_apps)
+                    m2.metric("Average Match Score", f"{avg_score:.1f}%")
+                    st.markdown("---")
+
+                    job_titles = sorted(list(set([row[4] if row[4] else "Self Analysis" for row in all_apps])))
+                    selected_job = st.selectbox("Filter by Job:", ["All Jobs"] + job_titles)
+                    
+                    display_apps = all_apps
+                    if selected_job != "All Jobs":
+                        display_apps = [row for row in all_apps if (row[4] == selected_job) or (selected_job=="Self Analysis" and row[4] is None)]
+                    
+                    st.write(f"Showing **{len(display_apps)}** candidates for *{selected_job}*:")
+
+                    csv_buffer = io.StringIO()
+                    writer = csv.writer(csv_buffer)
+                    writer.writerow(["ID", "Name", "Email", "Score", "Job Title", "Applied Date", "GitHub", "LinkedIn", "Missing Skills", "Matched Skills"])
+                    
+                    for row in all_apps:
+                        try:
+                            meta = json.loads(row[6])
+                            missing_s = ", ".join(meta.get('details', {}).get('missing_skills', []))
+                            matched_s = ", ".join(meta.get('details', {}).get('found_skills', []))
+                        except:
+                            missing_s = ""
+                            matched_s = ""
+                        writer.writerow([row[0], row[1], row[2], row[3], row[4], row[5], row[7], row[8], missing_s, matched_s])
+                    
+                    st.download_button(
+                        label="📥 Download Detailed Report (CSV)",
+                        data=csv_buffer.getvalue(),
+                        file_name=f"application_report_{datetime.date.today()}.csv",
+                        mime="text/csv"
+                    )
+
+                    for app in display_apps:
+                        aid, name, email, score, job_title, date, meta_json, gh, li, resume_text = app
+                        job_title = job_title or "Self Analysis"
+                        try:
+                            meta = json.loads(meta_json)
+                            missing = meta.get('details', {}).get('missing_skills', [])
+                        except:
+                            missing = []
+
+                        with st.expander(f"**{name}** - Score: {score}% ({job_title})"):
+                            cols = st.columns([1, 1])
+                            with cols[0]:
+                                st.write(f"**Email:** {email}")
+                                st.write(f"**Applied Date:** {date[:10]}")
+                                st.markdown(f"**GitHub:** {gh if gh else 'N/A'}")
+                            with cols[1]:
+                                if missing:
+                                    st.error(f"⚠️ Missing Skills: {', '.join(missing[:5])}...")
+                                else:
+                                    st.success("✅ Good Skill Match!")
+                            
+                            with st.expander("📄 View Resume Content"):
+                                st.text(resume_text)
+                else:
+                    st.info("No applications found in database.")
+
+            with tab_admin[3]:
+                st.markdown("### 🗣️ User Feedback & Help Requests")
+                c = _conn.cursor()
+                c.execute("SELECT id, username, category, message, created_at FROM feedback ORDER BY created_at DESC")
+                fb_data = c.fetchall()
+                if fb_data:
+                    df = pd.DataFrame(fb_data, columns=["ID", "User", "Category", "Message", "Date"])
+                    st.dataframe(df, use_container_width=True)
+                else:
+                    st.info("No feedback submitted yet.")
+        else:
+            st.error("Admins only.")
+
+    elif nav == "My Applications":
+        if st.session_state['auth']['logged_in']:
+            uid = st.session_state['auth']['user']['id']
+            c = _conn.cursor()
+            c.execute("""SELECT j.title, j.company_name, a.score, a.created_at, a.metadata, j.description 
+                         FROM applications a LEFT JOIN jobs j ON a.job_id = j.id 
+                         WHERE a.user_id = ? ORDER BY a.created_at DESC""", (uid,))
+            rows = c.fetchall()
+            st.subheader("My History 📅")
+            if not rows:
+                st.info("You haven't applied to any jobs or run saved analyses yet.")
+            for r in rows:
+                jt = r[0] or "Self Analysis"
+                comp = r[1] or "N/A"
+                score = r[2]
+                date = r[3]
+                desc = r[5]
+                
+                with st.expander(f"**{jt}** ({comp}) - Score: **{score}%** - {date}"):
+                    if desc:
+                        st.markdown("### 📄 Job Description")
+                        st.write(desc)
+                    try:
+                        meta = json.loads(r[4])
+
+                    except:
+                        pass
+        else:
+            st.warning("Please login to view history.")
+
+    elif nav == "Help & Support":
+        st.markdown("<div class='section'>", unsafe_allow_html=True)
+        st.subheader("Help & Support 🤝")
+        
+        tab_h1, tab_h2 = st.tabs(["📖 User Guide", "📧 Contact / Feedback"])
+        
+        with tab_h1:
+            st.write("""
+            **How to use:**
+            1.  **Jobs Board:** Browse open roles and click 'Apply' to pre-load the analysis tool.
+            2.  **Analyze Resume:** Upload your resume and a Job Description.
+            3.  **Get Results:** This will calculate a match score.
+            4.  **Admin:** If you are an admin, use the panel to manage jobs and view applicants.
+            """)
+        
+        with tab_h2:
+            st.write("Have a question, found a bug, or want to suggest a feature? Let us know!")
+            with st.form("feedback_form"):
+                fb_cat = st.selectbox("Category", ["General Help", "Bug Report", "Feature Request", "Other"])
+                fb_msg = st.text_area("Message", placeholder="Describe your issue or suggestion here...")
+                submitted = st.form_submit_button("Submit Feedback")
+                
+                if submitted:
+                    if fb_msg:
+                        if st.session_state['auth']['logged_in']:
+                            u_id = st.session_state['auth']['user']['id']
+                            u_name = st.session_state['auth']['user']['username']
+                        else:
+                            u_id = 0
+                            u_name = "Guest"
+                        submit_feedback(u_id, u_name, fb_cat, fb_msg)
+                        st.success("Thank you! Your feedback has been sent to the admins.")
+                    else:
+                        st.error("Please enter a message.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+if __name__ == "__main__":
+    main()
